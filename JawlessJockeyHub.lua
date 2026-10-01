@@ -21325,6 +21325,13 @@ function Lycoris.init()
 		end)
 	end
 
+	-- Resume Auto Saramed / Auto Moon's Eyrie after a server hop or dungeon teleport (pfdata survives via MemStorage).
+	if PersistentData.get("pfdata") then
+		task.spawn(function()
+			require("Features/Automation/PveFarm").start()
+		end)
+	end
+
 	Logger.notify("Script has been initialized in %ims.", (os.clock() - startTimestamp) * 1000)
 
 	if not PersistentData.get("fli") then
@@ -25078,6 +25085,1769 @@ end
 
 -- Return TitusFarm module.
 return TitusFarm
+
+end)
+__bundle_register("Features/Automation/PveFarm", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- PveFarm module. Auto Saramed (Deepdrill dungeon) & Auto Moon's Eyrie (Moonseye knight), ported from Project Rain.
+local PveFarm = { running = false, mode = nil }
+
+---@module GUI.Library
+local Library = require("GUI/Library")
+
+---@module Utility.CoreGuiManager
+local CoreGuiManager = require("Utility/CoreGuiManager")
+
+---@module Utility.Logger
+local Logger = require("Utility/Logger")
+
+---@module Utility.Finder
+local Finder = require("Utility/Finder")
+
+---@module Utility.PersistentData
+local PersistentData = require("Utility/PersistentData")
+
+---@module Game.ServerHop
+local ServerHop = require("Game/ServerHop")
+
+---@module Game.AntiAFK
+local AntiAFK = require("Game/AntiAFK")
+
+---@module Game.InputClient
+local InputClient = require("Game/InputClient")
+
+-- Services.
+local players = game:GetService("Players")
+local runService = game:GetService("RunService")
+local replicatedStorage = game:GetService("ReplicatedStorage")
+
+local localPlayer = players.LocalPlayer
+
+-- Constants.
+local EASTERN_PLACE_ID = 6473861193
+local DUNGEON_PLACE_ID = 8668476218
+local DEPTHS_PLACE_ID = 5735553160
+
+local SARAMED_NPC = CFrame.new(-2856.81, 135.67, 3375.38)
+local SARAMED_WELL = CFrame.new(-2814.17, 145.32, 3119.74)
+local EYRIE_CAMPFIRE = CFrame.new(-7632.28, 980.37, 421.91)
+
+local PLAYER_CHECK_RANGE = 200
+local STAGE_TIMEOUT = 240
+local MOB_TIMEOUT = 60
+local KNIGHT_STALL_TIMEOUT = 20
+local EYRIE_MIN_HEALTH = 0.35
+local REST_HEALTH = 0.5
+local MAX_CONSECUTIVE_ERRORS = 3
+local FUEL_FULL_COLOR = Color3.fromRGB(141, 239, 112):ToHex()
+local KNIGHT_KICK_ANIMATIONS = { "106711913879378", "111024000122473" }
+local FOODS = { "Pomar", "Mushroom Soup", "Bread" }
+
+local TEXT = {
+	saramedTitle = "Auto Saramed",
+	eyrieTitle = "Auto Moon's Eyrie",
+	stage = "Stage: %s",
+	cycles = "Cycles: %d",
+	elapsed = "Elapsed: %d:%02d:%02d",
+	stopButton = "Stop",
+
+	started = "%s started.",
+	stopped = "PvE Farm stopped.",
+	otherFarm = "PvE Farm: Another farm (Titus / Ferryman) is still active, stop it first.",
+	notInPlace = "PvE Farm: Not in a supported place, stopping.",
+	wrongSlot = "PvE Farm: On a different slot than started, stopping.",
+	inDepths = "PvE Farm: Ended up in the depths, stopping.",
+	needCharacter = "PvE Farm: Start this on an existing character, stopping.",
+	needPickaxe = "PvE Farm: Auto Saramed needs a Pickaxe in your inventory.",
+	tooManyErrors = "PvE Farm: Too many errors in a row, stopping.",
+	hopNotify = "PvE Farm: %s: Server hopping",
+
+	reasonPlayerNearby = "player nearby",
+	reasonTimeout = "timeout",
+	reasonStuck = "stuck on a stage",
+	reasonCycleComplete = "cycle complete",
+	reasonError = "error",
+
+	stageLoading = "loading in",
+	stageFood = "refilling food & water",
+	stageTravel = "travelling",
+	stageEntering = "entering dungeon",
+	stageDescending = "descending",
+	stageFighting = "fighting mobs",
+	stageMining = "mining magma ore",
+	stageLooting = "looting chest",
+	stageResetting = "resetting drill",
+	stageResting = "resting at campfire",
+	stageLeaving = "leaving dungeon",
+	stageDoor = "opening moonseye door",
+	stageKnight = "fighting moonknight",
+	stageSafety = "escaping danger",
+	stageDead = "waiting for respawn",
+	stagePickaxe = "waiting for a pickaxe",
+}
+
+-- State.
+local hopping = false
+local startSlot = nil
+local startedAt = 0
+local cycles = 0
+local errors = 0
+local minHealth = 0.25
+local attachDistance = 8
+local stageDeadline = 0
+local connections = {}
+local threads = {}
+local previousToggles = {}
+
+-- Overlay.
+local screenGui, titleLabel, stageLabel, cyclesLabel, elapsedLabel = nil, nil, nil, nil, nil
+
+-- Used to press E (campfire rest / well).
+local virtualInput = nil
+
+pcall(function()
+	virtualInput = Instance.new("VirtualInputManager")
+end)
+
+if not virtualInput then
+	pcall(function()
+		virtualInput = game:GetService("VirtualInputManager")
+	end)
+end
+
+---@return any
+local function currentSlot()
+	return localPlayer and localPlayer:GetAttribute("DataSlot")
+end
+
+---@return Model?
+local function getCharacter()
+	return localPlayer and localPlayer.Character
+end
+
+---@return BasePart?
+local function getRoot()
+	local character = getCharacter()
+	return character and character:FindFirstChild("HumanoidRootPart")
+end
+
+---@return Humanoid?
+local function getHumanoid()
+	local character = getCharacter()
+	return character and character:FindFirstChildOfClass("Humanoid")
+end
+
+---@return boolean
+local function alive()
+	local humanoid = getHumanoid()
+	return humanoid ~= nil and humanoid.Health > 0 and getRoot() ~= nil
+end
+
+---Should the current routine keep going?
+---@return boolean
+local function active()
+	return PveFarm.running and not hopping and alive()
+end
+
+---@param percent number
+---@return boolean
+local function healthBelow(percent)
+	local humanoid = getHumanoid()
+	return humanoid ~= nil and humanoid.Health <= humanoid.MaxHealth * percent
+end
+
+---@param name string
+---@return boolean
+local function hasEffect(name)
+	local ok, result = pcall(function()
+		return require(replicatedStorage.EffectReplicator):FindEffect(name)
+	end)
+	return ok and result ~= nil and result ~= false
+end
+
+---@param connection RBXScriptConnection
+---@return RBXScriptConnection
+local function track(connection)
+	connections[#connections + 1] = connection
+	return connection
+end
+
+---@param fn function
+---@return thread
+local function spawnTracked(fn, ...)
+	local thread = task.spawn(fn, ...)
+	threads[#threads + 1] = thread
+	return thread
+end
+
+---@param name string
+---@param default number
+---@return number
+local function optionNumber(name, default)
+	local option = Options and Options[name]
+	local value = option and tonumber(option.Value)
+	return value or default
+end
+
+local function saveState()
+	PersistentData.set("pfdata", {
+		mode = PveFarm.mode,
+		slot = startSlot,
+		started = startedAt,
+		cycles = cycles,
+		errors = errors,
+		health = minHealth,
+		attach = attachDistance,
+	})
+end
+
+---@param name string
+---@param value boolean
+local function setToggle(name, value)
+	local toggle = Toggles and Toggles[name]
+	if not toggle then
+		return
+	end
+
+	if previousToggles[name] == nil then
+		previousToggles[name] = toggle.Value
+	end
+
+	if toggle.Value ~= value then
+		toggle:SetValue(value)
+	end
+end
+
+local function restoreToggles()
+	for name, value in next, previousToggles do
+		local toggle = Toggles and Toggles[name]
+		if toggle and toggle.Value ~= value then
+			toggle:SetValue(value)
+		end
+	end
+
+	table.clear(previousToggles)
+end
+
+---@return Instance?
+local function guiParent()
+	local ok, hui = pcall(function()
+		return gethui and gethui()
+	end)
+	if ok and hui then
+		return hui
+	end
+
+	return game:GetService("CoreGui")
+end
+
+---@param class string
+---@param props table
+---@param parent Instance?
+---@return Instance
+local function mk(class, props, parent)
+	local instance = Instance.new(class)
+	for key, value in next, props do
+		instance[key] = value
+	end
+	instance.Parent = parent
+	return instance
+end
+
+---@param y number
+---@param text string
+---@param parent Instance
+---@return TextLabel
+local function mkLabel(y, text, parent)
+	local label = mk("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 8, 0, y),
+		Size = UDim2.new(1, -16, 0, 20),
+		FontFace = Library.Font,
+		TextSize = 14,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextColor3 = Library.FontColor or Color3.new(1, 1, 1),
+		Text = text,
+		ZIndex = 201,
+	}, parent)
+	Library:AddToRegistry(label, { TextColor3 = "FontColor" })
+	return label
+end
+
+local function buildOverlay()
+	if screenGui then
+		return
+	end
+
+	screenGui = CoreGuiManager.imark(Instance.new("ScreenGui"))
+	screenGui.Name = "PveFarmOverlay"
+	screenGui.ResetOnSpawn = false
+	screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Global
+	screenGui.DisplayOrder = 9999
+
+	local protectGui = protectgui or (syn and syn.protect_gui) or function() end
+	pcall(protectGui, screenGui)
+	screenGui.Parent = guiParent()
+
+	local outer = mk("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0),
+		Position = UDim2.new(0.5, 0, 0, 46),
+		Size = UDim2.new(0, 260, 0, 126),
+		BackgroundColor3 = Library.MainColor,
+		BorderColor3 = Library.OutlineColor,
+		BorderSizePixel = 1,
+		ZIndex = 200,
+	}, screenGui)
+	Library:AddToRegistry(outer, { BackgroundColor3 = "MainColor", BorderColor3 = "OutlineColor" })
+
+	titleLabel = mk("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 8, 0, 6),
+		Size = UDim2.new(1, -16, 0, 20),
+		FontFace = Library.Font,
+		TextSize = 16,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextColor3 = Library.AccentColor,
+		Text = TEXT.saramedTitle,
+		ZIndex = 201,
+	}, outer)
+	Library:AddToRegistry(titleLabel, { TextColor3 = "AccentColor" })
+
+	stageLabel = mkLabel(28, string.format(TEXT.stage, TEXT.stageLoading), outer)
+	cyclesLabel = mkLabel(48, string.format(TEXT.cycles, 0), outer)
+	elapsedLabel = mkLabel(68, string.format(TEXT.elapsed, 0, 0, 0), outer)
+
+	local stopButton = mk("TextButton", {
+		Position = UDim2.new(0, 8, 1, -30),
+		Size = UDim2.new(1, -16, 0, 22),
+		AutoButtonColor = true,
+		BackgroundColor3 = Library:GetDarkerColor(Library.MainColor),
+		BorderColor3 = Library.OutlineColor,
+		BorderSizePixel = 1,
+		FontFace = Library.Font,
+		TextSize = 15,
+		TextColor3 = Library.FontColor or Color3.new(1, 1, 1),
+		Text = TEXT.stopButton,
+		ZIndex = 201,
+	}, outer)
+	Library:AddToRegistry(stopButton, {
+		BackgroundColor3 = function()
+			return Library:GetDarkerColor(Library.MainColor)
+		end,
+		BorderColor3 = "OutlineColor",
+		TextColor3 = "FontColor",
+	})
+
+	stopButton.MouseButton1Click:Connect(function()
+		PveFarm.stop()
+	end)
+
+	pcall(function()
+		Library:MakeDraggable(outer)
+	end)
+
+	screenGui.Enabled = false
+end
+
+---Set the overlay stage and reset the stuck watchdog.
+---@param text string
+local function setStage(text)
+	stageDeadline = os.clock() + STAGE_TIMEOUT
+
+	if stageLabel then
+		stageLabel.Text = string.format(TEXT.stage, text)
+	end
+end
+
+local function teardown()
+	PveFarm.running = false
+
+	for _, connection in next, connections do
+		pcall(function()
+			connection:Disconnect()
+		end)
+	end
+	table.clear(connections)
+
+	local current = coroutine.running()
+	for _, thread in next, threads do
+		if thread ~= current then
+			pcall(task.cancel, thread)
+		end
+	end
+	table.clear(threads)
+
+	restoreToggles()
+
+	AntiAFK.stop("PveFarm")
+
+	if screenGui then
+		screenGui.Enabled = false
+	end
+end
+
+---Server hop and resume the farm in the new server.
+---@param reason string
+function PveFarm.hop(reason)
+	if hopping or not PveFarm.running then
+		return
+	end
+
+	hopping = true
+
+	Logger.notify(TEXT.hopNotify, reason)
+
+	local blacklist = PersistentData.get("sblacklist") or {}
+	blacklist[game.JobId] = tick()
+	PersistentData.set("sblacklist", blacklist)
+
+	saveState()
+
+	teardown()
+
+	task.spawn(ServerHop.hop, startSlot or currentSlot(), false)
+end
+
+local function updateOverlay()
+	if PveFarm.running and not hopping and os.clock() >= stageDeadline then
+		return PveFarm.hop(TEXT.reasonStuck)
+	end
+
+	if cyclesLabel then
+		cyclesLabel.Text = string.format(TEXT.cycles, cycles)
+	end
+
+	if elapsedLabel then
+		local elapsed = math.max(0, os.time() - startedAt)
+		elapsedLabel.Text = string.format(
+			TEXT.elapsed,
+			math.floor(elapsed / 3600),
+			math.floor((elapsed % 3600) / 60),
+			math.floor(elapsed % 60)
+		)
+	end
+end
+
+---Move towards a goal at a fixed speed. The height is matched instantly, like Project Rain's tween.
+---@param goal CFrame
+---@param speed number
+---@return table
+local function tween(goal, speed)
+	local connection = nil
+
+	connection = track(runService.Heartbeat:Connect(function(dt)
+		local root = getRoot()
+		if not root then
+			return
+		end
+
+		local offset = Vector3.new(goal.X - root.Position.X, 0, goal.Z - root.Position.Z)
+
+		root.AssemblyLinearVelocity = Vector3.zero
+
+		if offset.Magnitude <= 10 then
+			root.CFrame = goal
+			return connection:Disconnect()
+		end
+
+		local step = math.min(speed * dt, offset.Magnitude)
+
+		root.CFrame = CFrame.new(root.Position.X, goal.Y, root.Position.Z) + offset.Unit * step
+	end))
+
+	return {
+		stop = function()
+			connection:Disconnect()
+		end,
+		wait = function()
+			while connection.Connected and active() do
+				task.wait()
+			end
+
+			connection:Disconnect()
+		end,
+	}
+end
+
+---Is another player within range of a position (defaults to us)?
+---@param position Vector3?
+---@param range number?
+---@return boolean
+local function playerNear(position, range)
+	local root = getRoot()
+	local origin = position or (root and root.Position)
+	return origin ~= nil and Finder.pnear(origin, range or PLAYER_CHECK_RANGE) ~= nil
+end
+
+---Tween somewhere high in the sky, hopping if a player is near us or the goal.
+---@param goal CFrame
+---@param speed number
+local function safeTween(goal, speed)
+	if playerNear() then
+		return PveFarm.hop(TEXT.reasonPlayerNearby)
+	end
+
+	local root = getRoot()
+	if not root then
+		return
+	end
+
+	local height = math.random(8000, 10000)
+	root.CFrame = root.CFrame + Vector3.new(0, height, 0)
+	tween(goal + Vector3.new(0, height, 0), speed).wait()
+
+	if not active() then
+		return
+	end
+
+	if playerNear(goal.Position) then
+		return PveFarm.hop(TEXT.reasonPlayerNearby)
+	end
+
+	root.CFrame = goal
+	task.wait(0.3)
+end
+
+---@param keyCode Enum.KeyCode
+local function pressKey(keyCode)
+	if not virtualInput then
+		return
+	end
+
+	pcall(function()
+		virtualInput:SendKeyEvent(true, keyCode, false, game)
+		task.wait(0.1)
+		virtualInput:SendKeyEvent(false, keyCode, false, game)
+	end)
+end
+
+---@param prompt Instance?
+local function firePrompt(prompt)
+	if prompt then
+		pcall(fireproximityprompt, prompt)
+	end
+end
+
+---@param a BasePart
+---@param b BasePart
+local function touch(a, b)
+	pcall(function()
+		firetouchinterest(a, b, 0)
+		firetouchinterest(a, b, 1)
+	end)
+end
+
+local function drawWeapon()
+	if hasEffect("Equipped") then
+		return
+	end
+
+	pcall(function()
+		getCharacter().CharacterHandler.Requests.DrawWeapon:FireServer(true)
+	end)
+end
+
+---@param condition function
+---@param timeout number
+---@return boolean met
+local function waitUntil(condition, timeout)
+	local deadline = os.clock() + timeout
+
+	while active() and os.clock() < deadline do
+		if condition() then
+			return true
+		end
+
+		task.wait(0.1)
+	end
+
+	return false
+end
+
+---@return boolean
+local function inCharacterCreation()
+	if localPlayer:GetAttribute("GameLoaded") == "CharacterCreation" then
+		return true
+	end
+
+	local creator = workspace:FindFirstChild("CharacterCreator")
+	local character = getCharacter()
+	return creator ~= nil and character ~= nil and character.Parent == creator
+end
+
+---@return boolean
+local function inLive()
+	local character = getCharacter()
+	return character ~= nil and character.Parent ~= nil and character.Parent.Name == "Live"
+end
+
+---Keep requesting to spawn in until our character is loaded and alive.
+local function requestStart()
+	local requests = replicatedStorage:WaitForChild("Requests")
+	local startMenu = requests:FindFirstChild("StartMenu")
+	local start = startMenu and startMenu:FindFirstChild("Start")
+	local deadline = os.clock() + 60
+
+	while PveFarm.running and not hopping and not (inLive() and alive()) and not inCharacterCreation() do
+		if os.clock() >= deadline then
+			return PveFarm.hop(TEXT.reasonTimeout)
+		end
+
+		if start and not inLive() then
+			start:FireServer(true)
+		end
+
+		task.wait(0.25)
+	end
+end
+
+---Sit on the closest campfire and rest until we're back to half health.
+---@param campfirePart BasePart
+local function restAt(campfirePart)
+	setStage(TEXT.stageResting)
+
+	local prompt = campfirePart.Parent and campfirePart.Parent:FindFirstChild("InteractPrompt", true)
+
+	waitUntil(function()
+		local root = getRoot()
+		if root then
+			root.CFrame = campfirePart.CFrame * CFrame.new(0, 1, 0)
+		end
+
+		firePrompt(prompt)
+		task.wait(0.9)
+
+		return hasEffect("Resting")
+	end, 20)
+
+	waitUntil(function()
+		return not healthBelow(REST_HEALTH)
+	end, 180)
+
+	pressKey(Enum.KeyCode.E)
+	task.wait(1)
+end
+
+---@param parent Instance
+---@return BasePart?
+local function closestCampfire(parent)
+	local root = getRoot()
+	if not root then
+		return nil
+	end
+
+	local closest, closestDistance = nil, nil
+
+	for _, campfire in next, parent:GetChildren() do
+		if not campfire:IsA("Model") or not campfire.Name:match("Campfire") then
+			continue
+		end
+
+		local part = campfire:FindFirstChildWhichIsA("BasePart")
+		if not part then
+			continue
+		end
+
+		local distance = (root.Position - part.Position).Magnitude
+
+		if not closestDistance or distance < closestDistance then
+			closest, closestDistance = part, distance
+		end
+	end
+
+	return closest
+end
+
+---Open the closest chest and let Auto Loot decide what to take.
+---@param maxDistance number
+local function grabChest(maxDistance)
+	local thrown = workspace:FindFirstChild("Thrown")
+	local root = getRoot()
+	if not thrown or not root then
+		return
+	end
+
+	local chest, closestDistance = nil, nil
+
+	for _, object in next, thrown:GetChildren() do
+		local lid = object:FindFirstChild("Lid")
+		if not lid or not lid:IsA("BasePart") then
+			continue
+		end
+
+		local distance = (root.Position - lid.Position).Magnitude
+
+		if distance <= maxDistance and (not closestDistance or distance < closestDistance) then
+			chest, closestDistance = object, distance
+		end
+	end
+
+	if not chest then
+		return
+	end
+
+	setStage(TEXT.stageLooting)
+
+	local lid = chest.Lid
+	local playerGui = localPlayer:WaitForChild("PlayerGui")
+
+	tween(lid.CFrame, 170).wait()
+
+	waitUntil(function()
+		local current = getRoot()
+		if current then
+			current.CFrame = lid.CFrame
+		end
+
+		firePrompt(chest:FindFirstChildWhichIsA("ProximityPrompt", true))
+
+		return playerGui:FindFirstChild("ChoicePrompt") ~= nil
+	end, 5)
+
+	local prompt = playerGui:FindFirstChild("ChoicePrompt")
+	if not prompt then
+		return
+	end
+
+	-- Auto Loot (if enabled) takes what it wants, then we close whatever is left.
+	waitUntil(function()
+		return not prompt.Parent
+	end, 5)
+
+	if prompt.Parent then
+		pcall(function()
+			prompt.Choice:FireServer("EXIT")
+		end)
+	end
+end
+
+---Swing at a target until the condition says stop.
+---@param target Model
+---@param shouldStop function
+local function swingAt(target, shouldStop)
+	while active() and target.Parent and not shouldStop() do
+		local root = getRoot()
+		local targetRoot = target:FindFirstChild("HumanoidRootPart")
+		local humanoid = target:FindFirstChildOfClass("Humanoid")
+		if not targetRoot or not humanoid or humanoid.Health <= 0 then
+			break
+		end
+
+		drawWeapon()
+
+		pcall(function()
+			InputClient.left(CFrame.new(root.Position, targetRoot.Position), true)
+		end)
+
+		task.wait(0.15)
+	end
+end
+
+---------------------------------------------------------------------------------------------------
+-- Auto Saramed.
+---------------------------------------------------------------------------------------------------
+
+---@param name string
+---@return NumberValue?
+local function stat(name)
+	local character = getCharacter()
+	return character and character:FindFirstChild(name)
+end
+
+---@param name string
+---@param percent number
+---@return boolean
+local function statBelow(name, percent)
+	local value = stat(name)
+	return value ~= nil and value.Value <= value.MaxValue * percent
+end
+
+---@return boolean
+local function isCarnivore()
+	local character = getCharacter()
+	local passives = character and character:GetAttribute("ssv_Passives")
+	return type(passives) == "string" and passives:find("Carnivore") ~= nil
+end
+
+---Carnivores can't eat plants, so only thirst counts for them.
+---@return boolean
+local function needsFood()
+	return statBelow("Water", 0.25) or (statBelow("Stomach", 0.25) and not isCarnivore())
+end
+
+---Eat food from our inventory until our stomach is full.
+local function eatFromInventory()
+	local backpack = localPlayer:FindFirstChild("Backpack")
+	local humanoid = getHumanoid()
+	if not backpack or not humanoid or isCarnivore() then
+		return
+	end
+
+	for _, name in next, FOODS do
+		local tool = backpack:FindFirstChild(name)
+		if not tool or not statBelow("Stomach", 0.95) then
+			continue
+		end
+
+		humanoid:EquipTool(tool)
+		task.wait(0.3)
+
+		for _ = 1, 30 do
+			if not tool.Parent or not active() or not statBelow("Stomach", 0.95) then
+				break
+			end
+
+			pcall(function()
+				tool:Activate()
+			end)
+
+			task.wait(1)
+		end
+
+		pcall(function()
+			humanoid:UnequipTools()
+		end)
+	end
+end
+
+---@return Instance?
+local function nearestWell()
+	local root = getRoot()
+	local folder = workspace.Terrain:FindFirstChild("Water")
+	if not root or not folder then
+		return nil
+	end
+
+	local closest, closestDistance = nil, nil
+
+	for _, well in next, folder:GetChildren() do
+		if not well.Name:match("DrinkingWater") then
+			continue
+		end
+
+		local distance = (root.Position - well:GetPivot().Position).Magnitude
+
+		if not closestDistance or distance < closestDistance then
+			closest, closestDistance = well, distance
+		end
+	end
+
+	return closest
+end
+
+---Refill hunger (pomars) and thirst (well) in the Eastern Luminant.
+local function refillFood()
+	setStage(TEXT.stageFood)
+
+	eatFromInventory()
+
+	if statBelow("Stomach", 0.95) and not isCarnivore() then
+		local ingredients = workspace:FindFirstChild("Ingredients")
+
+		for _, pomar in next, ingredients and ingredients:GetChildren() or {} do
+			if not active() or not statBelow("Stomach", 0.95) then
+				break
+			end
+
+			local prompt = pomar:IsA("BasePart") and pomar.Name:match("Pomar") and pomar:FindFirstChild("InteractPrompt")
+			if not prompt then
+				continue
+			end
+
+			safeTween(pomar.CFrame, 170)
+
+			waitUntil(function()
+				local root = getRoot()
+				if root then
+					root.CFrame = pomar.CFrame
+				end
+
+				firePrompt(prompt)
+
+				return not prompt.Parent
+			end, 5)
+
+			eatFromInventory()
+		end
+	end
+
+	if not active() or not statBelow("Water", 0.95) then
+		return
+	end
+
+	local well = nearestWell()
+
+	safeTween(well and well:GetPivot() or SARAMED_WELL, 170)
+
+	waitUntil(function()
+		if well then
+			firePrompt(well:FindFirstChild("InteractPrompt", true))
+		else
+			pressKey(Enum.KeyCode.E)
+		end
+
+		return not statBelow("Water", 0.95)
+	end, 30)
+end
+
+---Travel to Malisae and enter the Saramed dungeon alone.
+local function enterSaramed()
+	if needsFood() then
+		refillFood()
+
+		if not active() then
+			return
+		end
+	end
+
+	setStage(TEXT.stageTravel)
+
+	safeTween(SARAMED_NPC, 170)
+
+	if not active() then
+		return
+	end
+
+	setStage(TEXT.stageEntering)
+
+	local npcs = workspace:WaitForChild("NPCs")
+	local malisae = npcs:WaitForChild("Malisae", 15)
+	if not malisae then
+		return PveFarm.hop(TEXT.reasonTimeout)
+	end
+
+	local playerGui = localPlayer:WaitForChild("PlayerGui")
+
+	waitUntil(function()
+		firePrompt(malisae:FindFirstChild("InteractPrompt"))
+		task.wait(0.4)
+
+		local dialogue = playerGui:FindFirstChild("DialogueGui")
+		return dialogue ~= nil and dialogue.Enabled
+	end, 15)
+
+	task.wait(1)
+
+	pcall(function()
+		replicatedStorage.Requests.SendDialogue:FireServer({ choice = "Enter alone." })
+	end)
+
+	-- We should be teleported into the dungeon; the script resumes from pfdata there.
+	task.wait(30)
+
+	PveFarm.hop(TEXT.reasonTimeout)
+end
+
+---@return boolean
+local function hasPickaxe()
+	local backpack = localPlayer:FindFirstChild("Backpack")
+	local character = getCharacter()
+	return (backpack and backpack:FindFirstChild("Pickaxe")) ~= nil or (character and character:FindFirstChild("Pickaxe")) ~= nil
+end
+
+---@return boolean
+local function mobsExist()
+	local live = workspace:FindFirstChild("Live")
+	if not live then
+		return false
+	end
+
+	for _, model in next, live:GetChildren() do
+		local humanoid = model:FindFirstChildOfClass("Humanoid")
+		if model:GetAttribute("MOB_rich_name") and humanoid and humanoid.Health > 0 then
+			return true
+		end
+	end
+
+	return false
+end
+
+---@return Model?
+local function closestMob()
+	local live = workspace:FindFirstChild("Live")
+	local root = getRoot()
+	if not live or not root then
+		return nil
+	end
+
+	local closest, closestDistance = nil, math.huge
+
+	for _, model in next, live:GetChildren() do
+		if not model:IsA("Model") or model == getCharacter() then
+			continue
+		end
+
+		if model.Name:sub(1, 1) ~= "." and not model:GetAttribute("MOB_rich_name") then
+			continue
+		end
+
+		local mobRoot = model:FindFirstChild("HumanoidRootPart")
+		local humanoid = model:FindFirstChildOfClass("Humanoid")
+		if not mobRoot or not humanoid or humanoid.Health <= 0 then
+			continue
+		end
+
+		local torso = model:FindFirstChild("Torso")
+		if torso and torso:FindFirstChild("RagdollAttach") then
+			continue
+		end
+
+		local distance = (mobRoot.Position - root.Position).Magnitude
+
+		if distance < closestDistance then
+			closest, closestDistance = model, distance
+		end
+	end
+
+	return closest
+end
+
+---Sit above (or under, for buncles & knights) a mob and swing until it dies or we're low.
+---@param target Model
+local function killMob(target)
+	local targetRoot = target:FindFirstChild("HumanoidRootPart")
+	if not targetRoot then
+		return
+	end
+
+	drawWeapon()
+
+	tween(targetRoot.CFrame, 170).wait()
+
+	local name = target.Name:lower()
+	local under = name:find("buncle") ~= nil or name:find("knight") ~= nil
+	local deadline = os.clock() + MOB_TIMEOUT
+
+	spawnTracked(function()
+		while active() and target.Parent and targetRoot.Parent do
+			local dt = task.wait()
+			local root = getRoot()
+			local position = targetRoot.Position
+			local clamped = CFrame.new(position.X, math.clamp(position.Y, 0, 1000), position.Z)
+			local goal = under and clamped * CFrame.new(0, -attachDistance, 0) * CFrame.Angles(math.rad(90), 0, 0)
+				or clamped * CFrame.new(0, attachDistance, 0) * CFrame.Angles(math.rad(-90), 0, 0)
+
+			if root then
+				local offset = goal.Position - root.Position
+
+				root.AssemblyLinearVelocity = Vector3.zero
+
+				-- Far away (mob got knocked back): move at 100 studs/s instead of snapping.
+				if offset.Magnitude > 30 then
+					root.CFrame = CFrame.new(root.Position + offset.Unit * math.min(100 * dt, offset.Magnitude))
+				else
+					root.CFrame = goal
+				end
+			end
+		end
+	end)
+
+	swingAt(target, function()
+		return healthBelow(minHealth) or os.clock() >= deadline
+	end)
+end
+
+---@param target BasePart
+local function mineOre(target)
+	tween(target.CFrame, 170).wait()
+
+	local prompt = target:FindFirstChild("InteractPrompt")
+
+	for _ = 1, 60 do
+		if not active() or not target.Parent then
+			return
+		end
+
+		local root = getRoot()
+		if root then
+			root.CFrame = target.CFrame
+		end
+
+		firePrompt(prompt)
+		task.wait()
+	end
+
+	waitUntil(function()
+		return not target:FindFirstChild("InteractPrompt")
+	end, 5)
+end
+
+---@return BasePart?
+local function closestOre()
+	local root = getRoot()
+	if not root then
+		return nil
+	end
+
+	local closest, closestDistance = nil, math.huge
+
+	for _, ore in next, workspace:GetDescendants() do
+		if not ore:IsA("MeshPart") or not ore.Name:match("MagmaOre") or not ore:FindFirstChild("InteractPrompt") then
+			continue
+		end
+
+		local distance = (root.Position - ore.Position).Magnitude
+
+		if distance < closestDistance then
+			closest, closestDistance = ore, distance
+		end
+	end
+
+	return closest
+end
+
+---@return Instance
+local function deepdrill()
+	return workspace:WaitForChild("Deepdrill", 30)
+end
+
+---@return boolean
+local function fuelFull()
+	local ok, full = pcall(function()
+		return deepdrill().DungeonDrill.FuelPort.Display.SurfaceGui.Bar.BackgroundColor3:ToHex() == FUEL_FULL_COLOR
+	end)
+	return ok and full
+end
+
+local function depositOre()
+	local hit = deepdrill().DungeonDrill.FuelPort.Hit
+
+	tween(hit.CFrame, 170).wait()
+	task.wait(1)
+end
+
+---Press the closest drill switch to go down a floor.
+local function startFloor()
+	setStage(TEXT.stageDescending)
+
+	local drill = deepdrill()
+	local root = getRoot()
+	local dungeonSwitch = drill.DungeonDrill.Switch
+	local elevatorSwitch = drill.Drillevator.Switch
+	local switch = dungeonSwitch
+
+	if (elevatorSwitch.Case.Position - root.Position).Magnitude < (dungeonSwitch.Case.Position - root.Position).Magnitude then
+		switch = elevatorSwitch
+	end
+
+	tween(switch.Case.CFrame, 170).wait()
+	task.wait(1)
+	firePrompt(switch:FindFirstChild("InteractPrompt"))
+	task.wait(2)
+end
+
+---Clear the floor's mobs, mine ore until the drill is fuelled, then loot the chest.
+local function clearFloor()
+	setStage(TEXT.stageFighting)
+
+	waitUntil(mobsExist, 45)
+
+	local deadline = os.clock() + 300
+
+	while active() and mobsExist() and not healthBelow(minHealth) and os.clock() < deadline do
+		local mob = closestMob()
+
+		if mob then
+			setStage(TEXT.stageFighting)
+			killMob(mob)
+		end
+
+		task.wait(0.1)
+	end
+
+	if not active() or healthBelow(minHealth) then
+		return
+	end
+
+	setStage(TEXT.stageMining)
+
+	for _ = 1, 6 do
+		local ore = nil
+
+		waitUntil(function()
+			ore = closestOre()
+			return ore ~= nil
+		end, 15)
+
+		if not ore or not active() then
+			break
+		end
+
+		setStage(TEXT.stageMining)
+		mineOre(ore)
+	end
+
+	depositOre()
+
+	-- Sanity itching can make us drop ore, so keep mining until the fuel bar is full.
+	deadline = os.clock() + 120
+
+	while active() and not fuelFull() and os.clock() < deadline do
+		local ore = closestOre()
+
+		setStage(TEXT.stageMining)
+
+		if ore then
+			mineOre(ore)
+		end
+
+		depositOre()
+	end
+
+	if not active() then
+		return
+	end
+
+	grabChest(1000)
+
+	cycles = cycles + 1
+	errors = 0
+
+	saveState()
+end
+
+---Ride the radio back up to the surface and rest if we're hurt.
+local function resetDrill()
+	setStage(TEXT.stageResetting)
+
+	local drill = deepdrill()
+	local switch = drill.DungeonDrill.Switch
+	local radio = drill.DungeonDrill.Radio
+	local playerGui = localPlayer:WaitForChild("PlayerGui")
+
+	waitUntil(function()
+		tween(switch.Case.CFrame, 170).wait()
+		firePrompt(radio:FindFirstChild("InteractPrompt"))
+
+		return playerGui:FindFirstChild("ChoicePrompt") ~= nil
+	end, 20)
+
+	local prompt = playerGui:FindFirstChild("ChoicePrompt")
+	if prompt then
+		pcall(function()
+			prompt.Choice:FireServer(true)
+		end)
+	end
+
+	local destructibles = workspace:WaitForChild("Destructibles", 30)
+	local campfire = destructibles and destructibles:WaitForChild("Campfire", 30)
+	local campfirePart = campfire and campfire:FindFirstChildWhichIsA("BasePart")
+	if not campfirePart then
+		return
+	end
+
+	waitUntil(function()
+		local root = getRoot()
+		return root ~= nil and (campfirePart.Position - root.Position).Magnitude <= 150
+	end, 180)
+
+	if active() and healthBelow(REST_HEALTH) then
+		tween(campfirePart.CFrame, 170).wait()
+		restAt(campfirePart)
+	end
+end
+
+---Leave the dungeon by dying at the exit so we can eat in the overworld.
+local function leaveDungeon()
+	setStage(TEXT.stageLeaving)
+
+	local exit = deepdrill():FindFirstChild("DungeonExit")
+	if exit then
+		tween(exit.CFrame, 170).wait()
+	end
+
+	task.wait(3)
+
+	pcall(function()
+		replicatesignal(localPlayer.Kill)
+	end)
+
+	task.delay(1, function()
+		local humanoid = getHumanoid()
+		local root = getRoot()
+
+		if humanoid and humanoid.Health > 1 and root then
+			root.CFrame = root.CFrame * CFrame.new(0, 9e9, 0)
+		end
+	end)
+
+	waitUntil(function()
+		return false
+	end, 15)
+end
+
+local function runSaramedDungeon()
+	if not deepdrill() then
+		return PveFarm.hop(TEXT.reasonTimeout)
+	end
+
+	if not hasPickaxe() then
+		Logger.notify(TEXT.needPickaxe)
+		setStage(TEXT.stagePickaxe)
+
+		while PveFarm.running and not hasPickaxe() do
+			stageDeadline = os.clock() + STAGE_TIMEOUT
+			task.wait(1)
+		end
+	end
+
+	-- Drop any ore we're holding into the fuel port.
+	spawnTracked(function()
+		while PveFarm.running do
+			local character = getCharacter()
+			local ore = character and character:FindFirstChild("MagmaOre")
+			local ok, hit = pcall(function()
+				return workspace.Deepdrill.DungeonDrill.FuelPort.Hit
+			end)
+
+			if ore and ok and hit then
+				touch(ore:FindFirstChildWhichIsA("BasePart") or ore, hit)
+			end
+
+			task.wait(0.2)
+		end
+	end)
+
+	while active() do
+		if needsFood() then
+			eatFromInventory()
+
+			if needsFood() then
+				return leaveDungeon()
+			end
+		end
+
+		startFloor()
+
+		if not active() then
+			return
+		end
+
+		clearFloor()
+
+		if not active() then
+			return
+		end
+
+		local depthText = ""
+		pcall(function()
+			depthText = deepdrill().DungeonDrill.DepthDisplay.SurfaceGui.TextLabel.Text
+		end)
+
+		if healthBelow(minHealth) or depthText:find("2.00", 1, true) then
+			resetDrill()
+		end
+	end
+end
+
+---------------------------------------------------------------------------------------------------
+-- Auto Moon's Eyrie.
+---------------------------------------------------------------------------------------------------
+
+---@param range number
+---@return Model?
+local function closestKnight(range)
+	local live = workspace:FindFirstChild("Live")
+	local root = getRoot()
+	if not live or not root then
+		return nil
+	end
+
+	local closest, closestDistance = nil, range
+
+	for _, mob in next, live:GetChildren() do
+		local mobRoot = mob:IsA("Model") and mob.Name:lower():find("moonknight") and mob:FindFirstChild("HumanoidRootPart")
+		if not mobRoot then
+			continue
+		end
+
+		local distance = (root.Position - mobRoot.Position).Magnitude
+
+		if distance < closestDistance then
+			closest, closestDistance = mob, distance
+		end
+	end
+
+	return closest
+end
+
+---@return boolean
+local function inDanger()
+	local humanoid = getHumanoid()
+	local expiration = humanoid and humanoid:GetAttribute("DangerExpiration")
+	return expiration ~= nil and expiration > 0
+end
+
+---Pick up loot drops near us.
+local function collectDrops()
+	local thrown = workspace:FindFirstChild("Thrown")
+	local root = getRoot()
+	if not thrown or not root then
+		return
+	end
+
+	for _, model in next, thrown:GetChildren() do
+		local drop = model:IsA("Model") and model:FindFirstChild("LootDrop")
+		if not drop or (root.Position - drop.Position).Magnitude > 100 or playerNear(drop.Position) then
+			continue
+		end
+
+		tween(drop.CFrame, 120).wait()
+
+		waitUntil(function()
+			local current = getRoot()
+			if current then
+				touch(drop, current)
+			end
+
+			return not drop.Parent
+		end, 3)
+	end
+end
+
+---Fight a moonknight from above, jumping higher while it kicks.
+---@param knight Model
+local function killKnight(knight)
+	local knightRoot = knight:FindFirstChild("HumanoidRootPart")
+	local humanoid = knight:FindFirstChildOfClass("Humanoid")
+	if not knightRoot or not humanoid then
+		return
+	end
+
+	setStage(TEXT.stageKnight)
+
+	drawWeapon()
+
+	tween(knightRoot.CFrame, 170).wait()
+
+	local kicking = false
+	local animator = knight:FindFirstChild("Animator", true)
+
+	if animator then
+		track(animator.AnimationPlayed:Connect(function(animationTrack)
+			local id = animationTrack.Animation and animationTrack.Animation.AnimationId or ""
+
+			for _, kick in next, KNIGHT_KICK_ANIMATIONS do
+				if id:find(kick, 1, true) then
+					kicking = true
+
+					task.delay(2, function()
+						kicking = false
+					end)
+				end
+			end
+		end))
+	end
+
+	spawnTracked(function()
+		while active() and knight.Parent and knightRoot.Parent do
+			local root = getRoot()
+
+			if root then
+				root.AssemblyLinearVelocity = Vector3.zero
+				root.CFrame = knightRoot.CFrame * CFrame.new(0, kicking and 60 or 10, 0) * CFrame.Angles(math.rad(-90), 0, 0)
+			end
+
+			task.wait()
+		end
+	end)
+
+	local lastHealth = humanoid.Health
+	local lastChange = os.clock()
+
+	swingAt(knight, function()
+		if humanoid.Health ~= lastHealth then
+			lastHealth = humanoid.Health
+			lastChange = os.clock()
+		end
+
+		return playerNear() or healthBelow(EYRIE_MIN_HEALTH) or os.clock() - lastChange >= KNIGHT_STALL_TIMEOUT
+	end)
+
+	if not active() or playerNear() then
+		return
+	end
+
+	task.wait(2)
+
+	collectDrops()
+end
+
+---Fly straight up until the danger timer runs out.
+local function toSafety()
+	setStage(TEXT.stageSafety)
+
+	local deadline = os.clock() + 90
+
+	while PveFarm.running and not hopping and alive() and inDanger() and os.clock() < deadline do
+		local root = getRoot()
+		if root then
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.CFrame = root.CFrame * CFrame.new(0, math.random(8000, 10000), 0)
+		end
+
+		task.wait(0.5)
+	end
+end
+
+local function runEyrie()
+	if healthBelow(EYRIE_MIN_HEALTH) then
+		setStage(TEXT.stageTravel)
+		safeTween(EYRIE_CAMPFIRE, 170)
+
+		local thrown = workspace:FindFirstChild("Thrown")
+		local campfirePart = active() and thrown and closestCampfire(thrown)
+
+		if campfirePart then
+			restAt(campfirePart)
+		end
+	end
+
+	if not active() then
+		return
+	end
+
+	setStage(TEXT.stageTravel)
+
+	local marker = replicatedStorage.MarkerWorkspace.AreaMarkers["Moon's Eyrie"].AreaMarker
+	safeTween(marker.CFrame, 170)
+
+	if not active() then
+		return
+	end
+
+	setStage(TEXT.stageDoor)
+
+	local door = workspace:WaitForChild("MoonseyeDoor", 30)
+	if not door then
+		return PveFarm.hop(TEXT.reasonTimeout)
+	end
+
+	drawWeapon()
+
+	safeTween(door.CFrame * CFrame.new(0, -5, 0), 170)
+
+	if not active() then
+		return
+	end
+
+	local playerGui = localPlayer:WaitForChild("PlayerGui")
+
+	waitUntil(function()
+		local npc = workspace.NPCs:FindFirstChild("MoonDoor")
+		firePrompt(npc and npc:FindFirstChild("InteractPrompt"))
+		task.wait(0.4)
+
+		local dialogue = playerGui:FindFirstChild("DialogueGui")
+		return dialogue ~= nil and dialogue.Enabled
+	end, 15)
+
+	pcall(function()
+		replicatedStorage.Requests.SendDialogue:FireServer({ choice = "[Interact]" })
+	end)
+
+	tween(door.CFrame * CFrame.new(0, 0, -100), 170).wait()
+
+	waitUntil(function()
+		return playerNear() or closestKnight(60) ~= nil
+	end, 3)
+
+	if not active() or playerNear() then
+		return
+	end
+
+	local knight = closestKnight(60)
+
+	if knight then
+		killKnight(knight)
+
+		if active() and not playerNear() and not healthBelow(EYRIE_MIN_HEALTH) then
+			task.wait(0.5)
+			grabChest(300)
+		end
+	end
+
+	-- Finish off any other knight that showed up.
+	local other = active() and not playerNear() and closestKnight(3000)
+
+	if other then
+		killKnight(other)
+	end
+
+	if knight then
+		cycles = cycles + 1
+		errors = 0
+		saveState()
+	end
+end
+
+---------------------------------------------------------------------------------------------------
+-- Routine.
+---------------------------------------------------------------------------------------------------
+
+---Figure out where we are and run one pass of the farm.
+local function checkArea()
+	requestStart()
+
+	if not PveFarm.running or hopping then
+		return
+	end
+
+	if inCharacterCreation() then
+		Logger.notify(TEXT.needCharacter)
+		return PveFarm.stop()
+	end
+
+	if game.PlaceId == DEPTHS_PLACE_ID then
+		Logger.notify(TEXT.inDepths)
+		return PveFarm.stop()
+	end
+
+	setToggle("NoStun", true)
+
+	if PveFarm.mode == "saramed" then
+		if game.PlaceId == EASTERN_PLACE_ID then
+			return enterSaramed()
+		end
+
+		if game.PlaceId == DUNGEON_PLACE_ID and workspace:WaitForChild("Deepdrill", 30) then
+			return runSaramedDungeon()
+		end
+	elseif game.PlaceId == EASTERN_PLACE_ID then
+		runEyrie()
+
+		if not PveFarm.running or hopping then
+			return
+		end
+
+		if alive() and inDanger() then
+			toSafety()
+		end
+
+		return PveFarm.hop(TEXT.reasonCycleComplete)
+	end
+
+	Logger.notify(TEXT.notInPlace)
+	PveFarm.stop()
+end
+
+local function runRoutine()
+	while PveFarm.running and not hopping do
+		local ok, err = pcall(checkArea)
+
+		if not PveFarm.running or hopping then
+			return
+		end
+
+		if not ok then
+			Logger.warn("(PveFarm) %s", tostring(err))
+
+			errors = errors + 1
+			saveState()
+
+			if errors >= MAX_CONSECUTIVE_ERRORS then
+				Logger.notify(TEXT.tooManyErrors)
+				return PveFarm.stop()
+			end
+
+			if alive() then
+				return PveFarm.hop(TEXT.reasonError)
+			end
+		end
+
+		-- We died (or the pass finished) without leaving the server, so wait to respawn and go again.
+		if not alive() then
+			setStage(TEXT.stageDead)
+		end
+
+		task.wait(1)
+	end
+end
+
+---Start a PvE farm. Pass a mode to start fresh, or nothing to resume after a hop.
+---@param mode string? "saramed" or "eyrie"
+function PveFarm.start(mode)
+	if PveFarm.running then
+		return
+	end
+
+	-- A wipe is in progress; the Wipe module will bring us back afterwards.
+	if PersistentData.get("wdata") then
+		return
+	end
+
+	local data = PersistentData.get("pfdata")
+
+	if mode then
+		if PersistentData.get("tfdata") or PersistentData.get("afdata") then
+			return Logger.notify(TEXT.otherFarm)
+		end
+
+		data = {
+			mode = mode,
+			slot = currentSlot(),
+			started = os.time(),
+			cycles = 0,
+			errors = 0,
+			health = optionNumber("SaramedMinHealth", 25) / 100,
+			attach = optionNumber("SaramedAttachDistance", 8),
+		}
+	elseif not data then
+		return
+	elseif data.slot and currentSlot() and data.slot ~= currentSlot() then
+		Logger.notify(TEXT.wrongSlot)
+		return PveFarm.stop()
+	end
+
+	PveFarm.mode = data.mode
+	startSlot = data.slot
+	startedAt = data.started or os.time()
+	cycles = data.cycles or 0
+	errors = data.errors or 0
+	minHealth = data.health or 0.25
+	attachDistance = data.attach or 8
+	hopping = false
+
+	PveFarm.running = true
+
+	saveState()
+
+	AntiAFK.start("PveFarm")
+
+	setToggle("Fly", true)
+	setToggle("NoClip", true)
+	setToggle("NoFallDamage", true)
+
+	buildOverlay()
+
+	titleLabel.Text = PveFarm.mode == "eyrie" and TEXT.eyrieTitle or TEXT.saramedTitle
+
+	setStage(TEXT.stageLoading)
+	updateOverlay()
+
+	screenGui.Enabled = true
+
+	track(runService.Heartbeat:Connect(updateOverlay))
+
+	spawnTracked(runRoutine)
+
+	Logger.notify(TEXT.started, titleLabel.Text)
+end
+
+---Stop the PvE farm and clear its saved state.
+function PveFarm.stop()
+	if not PveFarm.running and not PersistentData.get("pfdata") then
+		return
+	end
+
+	teardown()
+
+	PersistentData.set("pfdata", nil)
+
+	Logger.notify(TEXT.stopped)
+end
+
+-- Return PveFarm module.
+return PveFarm
 
 end)
 __bundle_register("Game/PlayerScanning", function(require, _LOADED, __bundle_register, __bundle_modules)
@@ -118697,6 +120467,9 @@ local AutoFerryman = require("Features/Automation/AutoFerryman")
 ---@module Features.Automation.TitusFarm
 local TitusFarm = require("Features/Automation/TitusFarm")
 
+---@module Features.Automation.PveFarm
+local PveFarm = require("Features/Automation/PveFarm")
+
 ---Attribute section.
 ---@param groupbox table
 function AutomationTab.initAttributeSection(groupbox)
@@ -118981,6 +120754,50 @@ function AutomationTab.initTitusFarmSection(groupbox)
 	end)
 end
 
+---@param groupbox table
+function AutomationTab.initPveFarmSection(groupbox)
+	groupbox:AddButton({
+		Text = "Start Auto Saramed",
+		DoubleClick = true,
+		Tooltip = "Start anywhere in the Eastern Luminant (or inside Saramed). Needs a Pickaxe. Handles hunger & thirst.",
+		Func = function()
+			PveFarm.start("saramed")
+		end,
+	})
+
+	groupbox:AddSlider("SaramedMinHealth", {
+		Text = "Minimum Health",
+		Tooltip = "Auto Saramed stops fighting and goes up to rest when your health drops below this.",
+		Min = 0,
+		Max = 100,
+		Rounding = 0,
+		Suffix = "%",
+		Default = 25,
+	})
+
+	groupbox:AddSlider("SaramedAttachDistance", {
+		Text = "Attach To Mob Distance",
+		Tooltip = "How far above (or below) a mob Auto Saramed sits while fighting.",
+		Min = 0,
+		Max = 10,
+		Rounding = 1,
+		Default = 8,
+	})
+
+	groupbox:AddButton({
+		Text = "Start Auto Moon's Eyrie",
+		DoubleClick = true,
+		Tooltip = "Start anywhere in the Eastern Luminant. Kills the moonknight, loots the chest and server hops.",
+		Func = function()
+			PveFarm.start("eyrie")
+		end,
+	})
+
+	groupbox:AddButton("Stop PvE Farm", function()
+		PveFarm.stop()
+	end)
+end
+
 ---Initialize tab.
 ---@param window table
 function AutomationTab.init(window)
@@ -118993,6 +120810,7 @@ function AutomationTab.init(window)
 	AutomationTab.initEffectAutomation(tab:AddDynamicGroupbox("Effect Automation"))
 	AutomationTab.initAutoFerrymanSection(tab:AddDynamicGroupbox("Auto Ferryman"))
 	AutomationTab.initTitusFarmSection(tab:AddDynamicGroupbox("Titus Farm"))
+	AutomationTab.initPveFarmSection(tab:AddDynamicGroupbox("Saramed & Moon's Eyrie"))
 	AutomationTab.initAutoLootSection(tab:AddDynamicGroupbox("Auto Loot"))
 
 	if LRM_UserNote then
